@@ -1,9 +1,91 @@
 #include <iostream>
 #include <string>
+#include <string.h>
+#include <stdlib.h>
 #include <signal.h>
 #include "lmdb.h"
 
 namespace lmdb {
+
+class Val {
+
+private:
+    void* own;
+    MDB_val val;
+
+public:
+    Val() {
+        own = NULL;
+        val.mv_data = NULL;
+        val.mv_size = 0;        
+    }
+
+    Val(Val& other) {
+        own = NULL;
+        val.mv_data = NULL;
+        val.mv_size = 0;        
+        set(other.val.mv_data, other.val.mv_size);
+    }
+
+    ~Val() {
+        if(own) 
+            free(own);
+    }
+
+    operator MDB_val* () { return &val; }
+
+    long getSize() {
+        return val.mv_size;
+    }
+
+    bool startsWith(Val& other) {
+        return val.mv_size >= other.val.mv_size && memcmp(val.mv_data, other.val.mv_data, other.val.mv_size) == 0;
+    }
+
+    void set(std::string line, int beg, int end) {
+        set(line.c_str() + beg, end - beg);
+    }
+
+    void set(const void* data, size_t size) {
+        if(own) 
+            free(own);
+        if(size == 0) {
+            own = NULL;
+            val.mv_data = NULL;
+            val.mv_size = 0;        
+        } else {
+            own = malloc(size);
+            val.mv_data = own;
+            val.mv_size = size;        
+            if(!val.mv_data) {
+                std::cout << "ERROR: malloc() failed." << std::endl;
+                throw 0;
+            }
+            memcpy(val.mv_data, data, size);
+        }
+    }
+
+    std::ostream& print(std::ostream& stm) const {
+        static const char hexc[] = "0123456789ABCDEF";
+        unsigned char* cur = (unsigned char*) val.mv_data;
+        unsigned char* end = cur + val.mv_size;
+        while (cur < end) {
+            if (*cur >= ' ' && *cur <= 0x7F) {
+                stm << *cur;
+            } else {
+                stm << "\\x";
+                stm << hexc[*cur >> 4];
+                stm << hexc[*cur & 0xF];
+            }
+            cur++;
+        }
+        return stm;
+    }
+};
+
+std::ostream& operator << (std::ostream& stm, const Val& val) {
+    return val.print(stm);
+}
 
 class RetCode {
 
@@ -82,20 +164,34 @@ public:
 class Txn : RetCode {
 
 private:
+    Env& env;
+    unsigned int flags;
     MDB_txn* txn;
 
 public: 
-    Txn(Env& env, unsigned int flags) { 
+    Txn(Env& env, unsigned int flags) : env(env), flags(flags) { 
         rc = mdb_txn_begin(env, NULL, flags, &txn);
         if(rc)
             onError("mdb_txn_begin()");
     }
 
     ~Txn() { 
-        mdb_txn_abort(txn);
+        if(txn)
+            mdb_txn_abort(txn);
     }
 
     operator MDB_txn* () { return txn; }
+
+    void commit_and_begin() {
+	    rc = mdb_txn_commit(txn);
+        txn = NULL;
+        if(rc)
+            onError("mdb_txn_commit()");
+
+        rc = mdb_txn_begin(env, NULL, flags, &txn);
+        if(rc)
+            onError("mdb_txn_begin()");
+    }
 };
 
 class Dbi : RetCode {
@@ -125,37 +221,27 @@ public:
             onError("mdb_dbi_flags()");
         return flags;
     }
-};
 
-class Val {
+    bool get(lmdb::Val& key, lmdb::Val& data) {
+        rc = mdb_get(txn, dbi, key, data);
+        if(rc && rc != MDB_NOTFOUND) 
+            onError("mdb_get()");
+        return rc == 0;    
+    }
 
-private:
-    MDB_val val;
+    void put(lmdb::Val& key, lmdb::Val& data, unsigned int flags) {
+        rc = mdb_put(txn, dbi, key, data, flags);
+        if(rc) 
+            onError("mdb_put()");
+    }
 
-public:
-    operator MDB_val* () { return &val; }
-
-    std::ostream& print(std::ostream& stm) const {
-        static const char hexc[] = "0123456789ABCDEF";
-        unsigned char* cur = (unsigned char*) val.mv_data;
-        unsigned char* end = cur + val.mv_size;
-        while (cur < end) {
-            if (*cur >= ' ' && *cur <= 0x7F) {
-                stm << *cur;
-            } else {
-                stm << '\\';
-                stm << hexc[*cur >> 4];
-                stm << hexc[*cur & 0xF];
-            }
-            cur++;
-        }
-        return stm;
+    bool del(lmdb::Val& key) {
+        rc = mdb_del(txn, dbi, key, NULL);
+        if(rc && rc != MDB_NOTFOUND) 
+            onError("mdb_del()");
+        return rc == 0;    
     }
 };
-
-std::ostream& operator << (std::ostream& stm, const Val& val) {
-    return val.print(stm);
-}
 
 class Cursor : RetCode {
 
@@ -181,6 +267,18 @@ public:
             onError("mdb_cursor_get()");
         return rc == 0;    
     }
+
+    void put(lmdb::Val& key, lmdb::Val& data, unsigned int flags) {
+        rc = mdb_cursor_put(cursor, key, data, flags);
+        if(rc) 
+            onError("mdb_cursor_put()");
+    }
+
+    void del(unsigned int flags) {
+        rc = mdb_cursor_del(cursor, flags);
+        if(rc) 
+            onError("mdb_cursor_del()");
+    }
 };
 
 } // namespace lmdb
@@ -191,7 +289,181 @@ static void signal_handler( int sig ) {
     signal_last=sig;
 }
 
-static void print_env_info(lmdb::Env& env) {
+static void print_entry(lmdb::Val& key, lmdb::Val& data) {
+    std::cout << '+' << key << '=' << data << std::endl;
+}
+
+static void run_get(lmdb::Txn& txn, lmdb::Dbi& dbi, lmdb::Val& key, bool count) {
+    lmdb::Val data;
+    long num = 0;
+    if (dbi.get(key, data)) {
+        if(!count)
+            print_entry(key, data);
+        num++;
+    } else {
+        if(!count)
+            std::cout << "> not found" << std::endl;
+    }
+    if(count)
+        std::cout << "> " << num << std::endl;            
+}
+
+static void run_get_range(lmdb::Txn& txn, lmdb::Dbi& dbi, lmdb::Val& prefix, bool count) {
+    lmdb::Cursor cursor(txn, dbi);
+    MDB_cursor_op op = prefix.getSize() > 0 ? MDB_SET_RANGE : MDB_NEXT;
+    lmdb::Val key(prefix), data;
+    long num = 0;
+    while(cursor.get(key, data, op) && key.startsWith(prefix)) {
+        if(!count)
+            print_entry(key, data);
+        num++;
+        op = MDB_NEXT;
+    }
+    if(count)
+        std::cout << "> " << num << std::endl;            
+}
+
+static void run_put(lmdb::Txn& txn, lmdb::Dbi& dbi, lmdb::Val& key, lmdb::Val& data) {
+    dbi.put(key, data, 0);
+}
+
+static void run_remove(lmdb::Txn& txn, lmdb::Dbi& dbi, lmdb::Val& key) {
+    if (!dbi.del(key))
+        std::cout << "> not found" << std::endl;
+}
+
+static void run_remove_range(lmdb::Txn& txn, lmdb::Dbi& dbi, lmdb::Val& prefix) {
+    lmdb::Cursor cursor(txn, dbi);
+    MDB_cursor_op op = prefix.getSize() > 0 ? MDB_SET_RANGE : MDB_NEXT;
+    lmdb::Val key(prefix), data;
+    while(cursor.get(key, data, op) && key.startsWith(prefix)) {
+        cursor.del(0);
+        op = MDB_NEXT;
+    }
+}
+
+static void run_commit(lmdb::Txn& txn, lmdb::Dbi& dbi) {
+    txn.commit_and_begin();
+}
+
+static void run_eval_print_loop(lmdb::Env& env, lmdb::Txn& txn, lmdb::Dbi& dbi, bool verbose) {
+    if(verbose) {
+        std::cout << std::endl;
+        std::cout << "> Syntax:" << std::endl;
+        std::cout << ">     ?key          get" << std::endl;
+        std::cout << ">     ?prefix*      get range" << std::endl;
+        std::cout << ">     #prefix       find" << std::endl;
+        std::cout << ">     #prefix*      count range" << std::endl;
+        std::cout << ">     +key=data     put" << std::endl;
+        std::cout << ">     -key          remove" << std::endl;
+        std::cout << ">     -prefix*      remove range" << std::endl;
+        std::cout << ">     !             commit" << std::endl;
+        std::cout << "> Valid escape sequences are: \\r, \\n, \\t, \\=, \\*, \\_ and \\x00 ... \\xFF" << std::endl;           
+        std::cout << "> Press Ctrl-C to quit" << std::endl;           
+        std::cout << std::endl;
+    }
+    while(true) {
+        if(verbose) {
+            std::cout << "$ ";
+        }
+        std::string line;
+        std::getline(std::cin, line);
+        if (signal_last) {
+            std::cout << "> Received signal " << signal_last << ", exitting." << std::endl;
+            return;
+        }
+        
+        char command = '\0';
+        int pos_assign = -1;
+        int pos_asterisk = -1;
+        for (int i = 0; i < line.size(); i++) {
+            char c = line[i];
+            if(i == 0) {
+                command = c;
+            }
+            if(c == '\\') {
+                i++;
+            }
+            if(c == '=' && pos_assign == -1 && command == '+') {
+                pos_assign = i;
+            }
+            if(c == '*' && pos_asterisk == -1 && (command == '?' || command == '#' || command == '-')) {
+                pos_asterisk = i;
+            }
+        }
+        if(pos_asterisk != -1 && pos_asterisk != line.size() - 1) {
+            std::cout << "> ERROR: wildcard '*' must occur at end: " << line << std::endl;
+            continue;
+        }
+
+        lmdb::Val key, data;
+        if(command == '?' || command == '#' || command == '+' || command == '-') {
+            key.set(line, 1, pos_assign != -1 ? pos_assign : pos_asterisk != -1 ? pos_asterisk : line.size());
+            if(command == '+') {
+                if(pos_assign == -1) {
+                    std::cout << "> ERROR: missing '=': " << line << std::endl;
+                    continue;
+                }
+                data.set(line, pos_assign+1, line.size());
+            }
+        } 
+        if(command == '!') {
+            if(line.size() != 1) {
+                std::cout << "> ERROR: unexpeced data after '" << command << "': " << line << std::endl;
+                continue;
+            }
+        }
+        bool range = (pos_asterisk != -1);
+        //std::cout << "> command '" << command << "': key='" << key << "', data='" << data << "', range=" << (range ? "yes" : "no") << std::endl;
+        switch(command) {
+            case '?':
+                if(range) 
+                    run_get_range(txn, dbi, key, false);
+                else 
+                    run_get(txn, dbi, key, false);
+                break;  
+            case '#':
+                if(range) 
+                    run_get_range(txn, dbi, key, true);
+                else 
+                    run_get(txn, dbi, key, true);
+                break;
+            case '+':
+                run_put(txn, dbi, key, data);
+                break;
+            case '-':
+                if(range) 
+                    run_remove_range(txn, dbi, key);
+                else 
+                    run_remove(txn, dbi, key);
+                break;
+            case '!':
+                run_commit(txn, dbi);
+                break;
+            case '>':
+                break;
+            default:
+                std::cout << "> ERROR: unknown command: " << line << std::endl;
+                break;
+        }        
+    }
+}
+
+static void print_entries(lmdb::Env& env, lmdb::Txn& txn, lmdb::Dbi& dbi, bool verbose) {
+    lmdb::Cursor cursor(txn, dbi);
+    lmdb::Val key, data;
+    while (cursor.get(key, data, MDB_NEXT)) {
+        if (signal_last) {
+            std::cout << "> Received signal " << signal_last << ", aborting." << std::endl;
+            return;
+        }
+        print_entry(key, data);
+    }
+}
+
+static void print_info(lmdb::Env& env, lmdb::Txn& txn, lmdb::Dbi& dbi, bool verbose) {
+    std::cout << "Using liblmdb version: " << MDB_VERSION_STRING << std::endl;
+
     std::cout << "Environment flags: 0x" << std::hex << env.getFlags() << std::dec << std::endl;
 
     MDB_stat stat = env.getStat();
@@ -209,53 +481,37 @@ static void print_env_info(lmdb::Env& env) {
     std::cout << "ID of the last committed transaction: " << info.me_last_txnid << std::endl;
     std::cout << "max reader slots in the environment: " << info.me_maxreaders << std::endl;
     std::cout << "max reader slots used in the environment: " << info.me_numreaders << std::endl;
-}
 
-static void print_dbi_info(lmdb::Dbi& dbi) {
     std::cout << "Database interface flags: 0x" << std::hex << dbi.getFlags() << std::dec << std::endl;
-}
-
-static void print_all_entries(lmdb::Txn& txn, lmdb::Dbi& dbi)
-{
-    lmdb::Cursor cursor(txn, dbi);
-    lmdb::Val key, data;
-    while (cursor.get(key, data, MDB_NEXT)) {
-        if (signal_last) {
-            std::cout << "Received signal " << signal_last << ", aborting." << std::endl;
-            return;
-        }
-        std::cout << key << '=' << data << '\n';
-    }
 }
 
 static void print_usage() {
     std::cout << "lmdbsh -- LMDB Shell (Lightning memory-mapped database)" << std::endl;
-    std::cout << "Usage: $ lmdbsh [-info] [-rdonly] [-dump] database" << std::endl;
+    std::cout << std::endl;
+    std::cout << "Usage:" << std::endl;
+    std::cout << "    $ lmdbsh database [-rdonly] [-info] [-dump]" << std::endl;
+    std::cout << std::endl;
 }
 
-enum Command {
-    REPL,
-    DUMP
-};
+typedef void (Handler)(lmdb::Env& env, lmdb::Txn& txn, lmdb::Dbi& dbi, bool verbose);
 
 int main(int argc, char** argv) {
     try {
-        bool info = false;
+        std::string envname;
         int env_flags = MDB_NOSUBDIR;
         int txn_flags = 0;
         int dbi_flags = 0;
-        std::string envname;
-        Command command = REPL;
+        Handler* handler = run_eval_print_loop;
         for(int i = 1; i < argc; i++) {
             std::string arg(argv[i]);
-            if(arg == "-info") {
-                info = true;
+            if(arg[0] != '-') {
+                envname = arg;
             } else if(arg == "-rdonly") {
                 txn_flags |= MDB_RDONLY;
+            } else if(arg == "-info") {
+                handler = print_info;
             } else if(arg == "-dump") {
-                command = DUMP;
-            } else if(arg[0] != '-') {
-                envname = arg;
+                handler = print_entries;
             } else {
                 std::cout << "Invalid argument: " << arg << std::endl << std::endl;
                 print_usage();
@@ -272,10 +528,6 @@ int main(int argc, char** argv) {
         signal(SIGINT, signal_handler);
         signal(SIGTERM, signal_handler);
 
-        if(info) {
-            std::cout << "Using liblmdb version: " << MDB_VERSION_STRING << std::endl;
-        }
-
         lmdb::Env env;
 
         env.open(envname, env_flags, 0664);
@@ -284,18 +536,7 @@ int main(int argc, char** argv) {
 
         lmdb::Dbi dbi(env, txn, NULL, dbi_flags);
    
-        if(info) {
-            print_env_info(env);
-            print_dbi_info(dbi);
-        }
-
-        switch(command) {
-            case REPL:
-                break;
-            case DUMP:
-                print_all_entries(txn, dbi);
-                break;
-        }
+        (*handler)(env, txn, dbi, true);
 
         return 0;
 
