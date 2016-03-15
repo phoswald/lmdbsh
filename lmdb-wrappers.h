@@ -1,5 +1,6 @@
 #include "lmdb.h"
 #include <string>
+#include <vector>
 
 namespace lmdb {
 
@@ -9,10 +10,15 @@ private:
     void* own;
     MDB_val val;
 
+private:
+    void init(const void* data, size_t size);
+
 public:
     Val();
 
     Val(Val& other);
+
+    Val(const std::vector<char>& data);
 
     ~Val();
 
@@ -23,10 +29,6 @@ public:
     }
 
     bool startsWith(Val& other);
-
-    void set(std::string line, int beg, int end);
-
-    void set(const void* data, size_t size);
 
     std::ostream& print(std::ostream& stm) const;
 };

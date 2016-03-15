@@ -9,13 +9,13 @@ static void signal_handler( int sig ) {
 }
 
 static void print_entry(lmdb::Val& key, lmdb::Val& data) {
-    std::cout << '+' << key << '=' << data << std::endl;
+    std::cout << '+' << key << ':' << data << std::endl;
 }
 
 static void run_get(lmdb::Txn& txn, lmdb::Dbi& dbi, lmdb::Val& key, bool count) {
     lmdb::Val data;
     long num = 0;
-    if (dbi.get(key, data)) {
+    if (key.getSize() > 0 && dbi.get(key, data)) {
         if(!count)
             print_entry(key, data);
         num++;
@@ -33,6 +33,10 @@ static void run_get_range(lmdb::Txn& txn, lmdb::Dbi& dbi, lmdb::Val& prefix, boo
     lmdb::Val key(prefix), data;
     long num = 0;
     while(cursor.get(key, data, op) && key.startsWith(prefix)) {
+        if (signal_last) {
+            std::cout << "> received signal " << signal_last << ", aborting." << std::endl;
+            return;
+        }
         if(!count)
             print_entry(key, data);
         num++;
@@ -43,11 +47,14 @@ static void run_get_range(lmdb::Txn& txn, lmdb::Dbi& dbi, lmdb::Val& prefix, boo
 }
 
 static void run_put(lmdb::Txn& txn, lmdb::Dbi& dbi, lmdb::Val& key, lmdb::Val& data) {
-    dbi.put(key, data, 0);
+    if (key.getSize() > 0)
+        dbi.put(key, data, 0);
+    else 
+        std::cout << "> not possible (empty key)" << std::endl;
 }
 
 static void run_remove(lmdb::Txn& txn, lmdb::Dbi& dbi, lmdb::Val& key) {
-    if (!dbi.del(key))
+    if (key.getSize() == 0 || !dbi.del(key))
         std::cout << "> not found" << std::endl;
 }
 
@@ -56,6 +63,10 @@ static void run_remove_range(lmdb::Txn& txn, lmdb::Dbi& dbi, lmdb::Val& prefix) 
     MDB_cursor_op op = prefix.getSize() > 0 ? MDB_SET_RANGE : MDB_NEXT;
     lmdb::Val key(prefix), data;
     while(cursor.get(key, data, op) && key.startsWith(prefix)) {
+        if (signal_last) {
+            std::cout << "> received signal " << signal_last << ", aborting." << std::endl;
+            return;
+        }
         cursor.del(0);
         op = MDB_NEXT;
     }
@@ -63,6 +74,133 @@ static void run_remove_range(lmdb::Txn& txn, lmdb::Dbi& dbi, lmdb::Val& prefix) 
 
 static void run_commit(lmdb::Txn& txn, lmdb::Dbi& dbi) {
     txn.commit_and_begin();
+    std::cout << "> commited" << std::endl;
+}
+
+static bool parse_hex(char c, int& n) {
+    if(c >= '0' && c <= '9') {
+        n = c - '0';
+        return true;
+    } else if(c >= 'A' && c <= 'F') {
+        n = c - 'A' + 10;
+        return true;
+    } else if(c >= 'a' && c <= 'f') {
+        n = c - 'a' + 10;
+        return true;
+    } else {
+        return false;
+    }
+}
+
+static bool parse_char(const std::string& line, int& pos, char c) {
+    if(pos < line.size() && line[pos] == c) {
+        pos++;
+        return true;
+    }
+    return false;
+}
+
+static bool parse_eol(const std::string& line, int pos) {
+    if(pos == line.size()) {
+        return true;
+    } else {
+        std::cerr << "ERROR: unexepcted characters after position " << pos << " of line '" << line << "'." << std::endl;
+        return false;
+    }
+}
+
+static bool parse_value(const std::string& line, int& pos, std::vector<char>& chars) {
+    while(pos < line.size()) {
+        char c = line[pos];
+        if(c == ':' || c == '*') {
+            break;
+        }
+        if(c == '\\') {
+            pos++;
+            if(pos < line.size()) {
+                c = line[pos];
+                switch(c) {
+                    case 't':  c = '\t'; break;
+                    case 'r':  c = '\r'; break;
+                    case 'n':  c = '\n'; break;
+                    case '\\': c = '\\'; break;
+                    case '*':  c = '*';  break;
+                    case ':':  c = ':';  break;
+                    case 'x':  {
+                        if(pos + 2 < line.size()) {
+                            int hi = 0, lo = 0;
+                            if(parse_hex(line[pos+1], hi) && parse_hex(line[pos+2], lo)) {
+                                pos+=2;
+                                c = (hi << 4) + lo;
+                                break;
+                            }
+                        }
+                        // intentionally no break here
+                    }
+                    default:
+                        std::cerr << "ERROR: invalid escape sequence one line '" << line << "'." << std::endl;
+                        return false;
+                }                
+            }
+        }
+        pos++;
+        chars.push_back(c);
+    }
+    return true;
+}
+
+static bool parse_line(const std::string& line, char& command, std::vector<char>& key, std::vector<char>& data, bool& range) {
+    int pos = 0;
+    if(parse_char(line, pos, '?')) {
+        if(!parse_value(line, pos, key)) {
+            std::cerr << "ERROR: invalid '?'key['*'] command on line '" << line << "'." << std::endl;
+            return false;            
+        }
+        if(parse_char(line, pos, '*')) {
+           range = true; 
+        }
+        command = '?';
+        return parse_eol(line, pos);
+    }
+    if(parse_char(line, pos, '#')) {
+        if(!parse_value(line, pos, key)) {
+            std::cerr << "ERROR: invalid '#'key['*'] command on line '" << line << "'." << std::endl;
+            return false;            
+        }
+        if(parse_char(line, pos, '*')) {
+           range = true; 
+        }
+        command = '#';
+        return parse_eol(line, pos);
+    }
+    if(parse_char(line, pos, '+')) {
+        if(!parse_value(line, pos, key) || !parse_char(line, pos, ':') || !parse_value(line, pos, data)) {
+            std::cerr << "ERROR: invalid '+'key':'data command on line '" << line << "'." << std::endl;
+            return false;            
+        }
+        command = '+';
+        return parse_eol(line, pos);
+    }
+    if(parse_char(line, pos, '-')) {
+        if(!parse_value(line, pos, key)) {
+            std::cerr << "ERROR: invalid '-'key['*'] command on line '" << line << "'." << std::endl;
+            return false;            
+        }
+        if(parse_char(line, pos, '*')) {
+           range = true; 
+        }
+        command = '-';
+        return parse_eol(line, pos);
+    }
+    if(parse_char(line, pos, '!')) {
+        command = '!';        
+        return parse_eol(line, pos);
+    }
+    if(parse_char(line, pos, '>')) {
+        return true;
+    }
+    std::cerr << "ERROR: unknown command on line '" << line << "'." << std::endl;
+    return false;
 }
 
 static void run_eval_print_loop(lmdb::Env& env, lmdb::Txn& txn, lmdb::Dbi& dbi, bool verbose) {
@@ -88,96 +226,51 @@ static void run_eval_print_loop(lmdb::Env& env, lmdb::Txn& txn, lmdb::Dbi& dbi, 
         std::string line;
         std::getline(std::cin, line);
         if (signal_last) {
-            std::cout << "> Received signal " << signal_last << ", exitting." << std::endl;
+            std::cout << "> received signal " << signal_last << ", exitting." << std::endl;
             return;
         }
         
         char command = '\0';
-        int pos_assign = -1;
-        int pos_asterisk = -1;
-        for (int i = 0; i < line.size(); i++) {
-            char c = line[i];
-            if(i == 0) {
-                command = c;
-            }
-            if(c == '\\') {
-                i++;
-            }
-            if(c == '=' && pos_assign == -1 && command == '+') {
-                pos_assign = i;
-            }
-            if(c == '*' && pos_asterisk == -1 && (command == '?' || command == '#' || command == '-')) {
-                pos_asterisk = i;
-            }
+        std::vector<char> key;
+        std::vector<char> data;
+        bool range = false;
+        if(parse_line(line, command, key, data, range)) {
+            lmdb::Val keyVal(key);
+            lmdb::Val dataVal(data);
+            // std::cout << "> command '" << command << "': key='" << keyVal << "', data='" << dataVal << "', range=" << (range ? "yes" : "no") << std::endl;
+            switch(command) {
+                case '?':
+                    if(range) 
+                        run_get_range(txn, dbi, keyVal, false);
+                    else 
+                        run_get(txn, dbi, keyVal, false);
+                    break;  
+                case '#':
+                    if(range) 
+                        run_get_range(txn, dbi, keyVal, true);
+                    else 
+                        run_get(txn, dbi, keyVal, true);
+                    break;
+                case '+':
+                    run_put(txn, dbi, keyVal, dataVal);
+                    break;
+                case '-':
+                    if(range) 
+                        run_remove_range(txn, dbi, keyVal);
+                    else 
+                        run_remove(txn, dbi, keyVal);
+                    break;
+                case '!':
+                    run_commit(txn, dbi);
+                    break;
+            }        
         }
-        if(pos_asterisk != -1 && pos_asterisk != line.size() - 1) {
-            std::cout << "> ERROR: wildcard '*' must occur at end: " << line << std::endl;
-            continue;
-        }
-
-        lmdb::Val key, data;
-        if(command == '?' || command == '#' || command == '+' || command == '-') {
-            key.set(line, 1, pos_assign != -1 ? pos_assign : pos_asterisk != -1 ? pos_asterisk : line.size());
-            if(command == '+') {
-                if(pos_assign == -1) {
-                    std::cout << "> ERROR: missing '=': " << line << std::endl;
-                    continue;
-                }
-                data.set(line, pos_assign+1, line.size());
-            }
-        } 
-        if(command == '!') {
-            if(line.size() != 1) {
-                std::cout << "> ERROR: unexpeced data after '" << command << "': " << line << std::endl;
-                continue;
-            }
-        }
-        bool range = (pos_asterisk != -1);
-        //std::cout << "> command '" << command << "': key='" << key << "', data='" << data << "', range=" << (range ? "yes" : "no") << std::endl;
-        switch(command) {
-            case '?':
-                if(range) 
-                    run_get_range(txn, dbi, key, false);
-                else 
-                    run_get(txn, dbi, key, false);
-                break;  
-            case '#':
-                if(range) 
-                    run_get_range(txn, dbi, key, true);
-                else 
-                    run_get(txn, dbi, key, true);
-                break;
-            case '+':
-                run_put(txn, dbi, key, data);
-                break;
-            case '-':
-                if(range) 
-                    run_remove_range(txn, dbi, key);
-                else 
-                    run_remove(txn, dbi, key);
-                break;
-            case '!':
-                run_commit(txn, dbi);
-                break;
-            case '>':
-                break;
-            default:
-                std::cout << "> ERROR: unknown command: " << line << std::endl;
-                break;
-        }        
     }
 }
 
 static void print_entries(lmdb::Env& env, lmdb::Txn& txn, lmdb::Dbi& dbi, bool verbose) {
-    lmdb::Cursor cursor(txn, dbi);
-    lmdb::Val key, data;
-    while (cursor.get(key, data, MDB_NEXT)) {
-        if (signal_last) {
-            std::cout << "> Received signal " << signal_last << ", aborting." << std::endl;
-            return;
-        }
-        print_entry(key, data);
-    }
+    lmdb::Val key;
+    run_get_range(txn, dbi, key, false);
 }
 
 static void print_info(lmdb::Env& env, lmdb::Txn& txn, lmdb::Dbi& dbi, bool verbose) {
@@ -232,7 +325,7 @@ int main(int argc, char** argv) {
             } else if(arg == "-dump") {
                 handler = print_entries;
             } else {
-                std::cout << "Invalid argument: " << arg << std::endl << std::endl;
+                std::cerr << "ERROR: Invalid argument: " << arg << std::endl << std::endl;
                 print_usage();
                 return 1;
             }
@@ -260,7 +353,7 @@ int main(int argc, char** argv) {
         return 0;
 
     } catch(int rc) {
-        std::cout << "Failing, error code " << rc << std::endl;
+        std::cerr << "Terminating with error code " << rc << std::endl;
         return 1;
     }
 }
