@@ -1,6 +1,8 @@
 #include "lmdb-wrappers.h"
 #include <iostream>
+#include <stdio.h>
 #include <signal.h>
+#include <unistd.h>
 
 static volatile int signal_last;
 
@@ -15,7 +17,7 @@ static void print_entry(lmdb::Val& key, lmdb::Val& data) {
 static void run_get(lmdb::Txn& txn, lmdb::Dbi& dbi, lmdb::Val& key, bool count) {
     lmdb::Val data;
     long num = 0;
-    if (key.getSize() > 0 && dbi.get(key, data)) {
+    if(key.getSize() > 0 && dbi.get(key, data)) {
         if(!count)
             print_entry(key, data);
         num++;
@@ -33,7 +35,7 @@ static void run_get_range(lmdb::Txn& txn, lmdb::Dbi& dbi, lmdb::Val& prefix, boo
     lmdb::Val key(prefix), data;
     long num = 0;
     while(cursor.get(key, data, op) && key.startsWith(prefix)) {
-        if (signal_last) {
+        if(signal_last) {
             std::cout << "> received signal " << signal_last << ", aborting." << std::endl;
             return;
         }
@@ -47,14 +49,14 @@ static void run_get_range(lmdb::Txn& txn, lmdb::Dbi& dbi, lmdb::Val& prefix, boo
 }
 
 static void run_put(lmdb::Txn& txn, lmdb::Dbi& dbi, lmdb::Val& key, lmdb::Val& data) {
-    if (key.getSize() > 0)
+    if(key.getSize() > 0)
         dbi.put(key, data, 0);
     else 
         std::cout << "> not possible (empty key)" << std::endl;
 }
 
 static void run_remove(lmdb::Txn& txn, lmdb::Dbi& dbi, lmdb::Val& key) {
-    if (key.getSize() == 0 || !dbi.del(key))
+    if(key.getSize() == 0 || !dbi.del(key))
         std::cout << "> not found" << std::endl;
 }
 
@@ -63,7 +65,7 @@ static void run_remove_range(lmdb::Txn& txn, lmdb::Dbi& dbi, lmdb::Val& prefix) 
     MDB_cursor_op op = prefix.getSize() > 0 ? MDB_SET_RANGE : MDB_NEXT;
     lmdb::Val key(prefix), data;
     while(cursor.get(key, data, op) && key.startsWith(prefix)) {
-        if (signal_last) {
+        if(signal_last) {
             std::cout << "> received signal " << signal_last << ", aborting." << std::endl;
             return;
         }
@@ -196,15 +198,16 @@ static bool parse_line(const std::string& line, char& command, std::vector<char>
         command = '!';        
         return parse_eol(line, pos);
     }
-    if(parse_char(line, pos, '>')) {
+    if(parse_char(line, pos, '>') || line.empty()) {
         return true;
     }
     std::cerr << "ERROR: unknown command on line '" << line << "'." << std::endl;
     return false;
 }
 
-static void run_eval_print_loop(lmdb::Env& env, lmdb::Txn& txn, lmdb::Dbi& dbi, bool verbose) {
-    if(verbose) {
+static void run_eval_print_loop(lmdb::Env& env, lmdb::Txn& txn, lmdb::Dbi& dbi) {
+    bool interactive = isatty(fileno(stdin));
+    if(interactive) {
         std::cout << std::endl;
         std::cout << "> Syntax:" << std::endl;
         std::cout << ">     ?key          get" << std::endl;
@@ -219,13 +222,13 @@ static void run_eval_print_loop(lmdb::Env& env, lmdb::Txn& txn, lmdb::Dbi& dbi, 
         std::cout << "> Press Ctrl-C to quit" << std::endl;           
         std::cout << std::endl;
     }
-    while(true) {
-        if(verbose) {
+    while(!std::cin.eof()) {
+        if(interactive) {
             std::cout << "$ ";
         }
         std::string line;
         std::getline(std::cin, line);
-        if (signal_last) {
+        if(signal_last) {
             std::cout << "> received signal " << signal_last << ", exitting." << std::endl;
             return;
         }
@@ -268,12 +271,12 @@ static void run_eval_print_loop(lmdb::Env& env, lmdb::Txn& txn, lmdb::Dbi& dbi, 
     }
 }
 
-static void print_entries(lmdb::Env& env, lmdb::Txn& txn, lmdb::Dbi& dbi, bool verbose) {
+static void print_entries(lmdb::Env& env, lmdb::Txn& txn, lmdb::Dbi& dbi) {
     lmdb::Val key;
     run_get_range(txn, dbi, key, false);
 }
 
-static void print_info(lmdb::Env& env, lmdb::Txn& txn, lmdb::Dbi& dbi, bool verbose) {
+static void print_info(lmdb::Env& env, lmdb::Txn& txn, lmdb::Dbi& dbi) {
     std::cout << "Using liblmdb version: " << MDB_VERSION_STRING << std::endl;
 
     std::cout << "Environment flags: 0x" << std::hex << env.getFlags() << std::dec << std::endl;
@@ -305,7 +308,7 @@ static void print_usage() {
     std::cout << std::endl;
 }
 
-typedef void (Handler)(lmdb::Env& env, lmdb::Txn& txn, lmdb::Dbi& dbi, bool verbose);
+typedef void (Handler)(lmdb::Env& env, lmdb::Txn& txn, lmdb::Dbi& dbi);
 
 int main(int argc, char** argv) {
     try {
@@ -340,7 +343,7 @@ int main(int argc, char** argv) {
         signal(SIGINT, signal_handler);
         signal(SIGTERM, signal_handler);
 
-        lmdb::Env env;
+        lmdb::Env env(512 << 20);
 
         env.open(envname, env_flags, 0664);
 
@@ -348,7 +351,7 @@ int main(int argc, char** argv) {
 
         lmdb::Dbi dbi(env, txn, NULL, dbi_flags);
    
-        (*handler)(env, txn, dbi, true);
+        (*handler)(env, txn, dbi);
 
         return 0;
 

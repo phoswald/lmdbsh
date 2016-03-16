@@ -56,18 +56,18 @@ std::ostream& Val::print(std::ostream& stm) const {
     char* end = cur + val.mv_size;
     while (cur < end) {
         char c = *cur;
-        if (c >= ' ' && c <= 0x7F) {
-            if (c == '\\' || c == '*' || c == ':') {
+        if(c >= ' ' && c <= 0x7F) {
+            if(c == '\\' || c == '*' || c == ':') {
                 stm << '\\';
             }
             stm << c;
-        } else if (c == '\t') {
+        } else if(c == '\t') {
             stm << '\\';
             stm << 't';
-        } else if (c == '\r') {
+        } else if(c == '\r') {
             stm << '\\';
             stm << 'r';
-        } else if (c == '\n') {
+        } else if(c == '\n') {
             stm << '\\';
             stm << 'n';
         } else {

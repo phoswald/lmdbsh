@@ -54,10 +54,14 @@ private:
     MDB_env* env;
 
 public:
-    Env() {
+    Env(size_t mapsize) {
         rc = mdb_env_create(&env);
         if(rc)
             onError("mdb_env_create()");
+
+        rc = mdb_env_set_mapsize(env, mapsize);
+        if(rc)
+            onError("mdb_env_set_mapsize()");
     }
 
     ~Env() {
